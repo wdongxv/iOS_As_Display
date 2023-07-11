@@ -10,7 +10,7 @@ The app's photo capture delegate object.
 
 @interface AVCamPhotoCaptureDelegate : NSObject<AVCapturePhotoCaptureDelegate>
 
-- (instancetype)initWithRequestedPhotoSettings:(AVCapturePhotoSettings *)requestedPhotoSettings willCapturePhotoAnimation:(void (^)(void))willCapturePhotoAnimation livePhotoCaptureHandler:(void (^)( BOOL capturing ))livePhotoCaptureHandler completionHandler:(void (^)( AVCamPhotoCaptureDelegate *photoCaptureDelegate ))completionHandler photoProcessingHandler:(void (^)(BOOL))animate;
+- (instancetype)initWithRequestedPhotoSettings:(AVCapturePhotoSettings *)requestedPhotoSettings willCapturePhotoAnimation:(void (^)(void))willCapturePhotoAnimation livePhotoCaptureHandler:(void (^)( BOOL capturing ))livePhotoCaptureHandler completionHandler:(void (^)( AVCamPhotoCaptureDelegate *photoCaptureDelegate ))completionHandler;
 
 @property (nonatomic, readonly) AVCapturePhotoSettings *requestedPhotoSettings;
 

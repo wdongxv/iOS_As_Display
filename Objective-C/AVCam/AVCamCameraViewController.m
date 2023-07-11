@@ -12,10 +12,10 @@ The app's primary view controller that presents the camera interface.
 #import "AVCamCameraViewController.h"
 #import "AVCamPreviewView.h"
 #import "AVCamPhotoCaptureDelegate.h"
-#import "ItemSelectionViewController.h"
 
 static void*  SessionRunningContext = &SessionRunningContext;
-static void*  SystemPressureContext = &SystemPressureContext;
+static void*  SystemPreferredCameraContext = &SystemPreferredCameraContext;
+static void*  VideoRotationAngleForHorizonLevelPreviewContext = &VideoRotationAngleForHorizonLevelPreviewContext;
 
 typedef NS_ENUM(NSInteger, AVCamSetupResult) {
     AVCamSetupResultSuccess,
@@ -31,16 +31,6 @@ typedef NS_ENUM(NSInteger, AVCamCaptureMode) {
 typedef NS_ENUM(NSInteger, AVCamLivePhotoMode) {
     AVCamLivePhotoModeOn,
     AVCamLivePhotoModeOff
-};
-
-typedef NS_ENUM(NSInteger, AVCamDepthDataDeliveryMode) {
-    AVCamDepthDataDeliveryModeOn,
-    AVCamDepthDataDeliveryModeOff
-};
-
-typedef NS_ENUM(NSInteger, AVCamPortraitEffectsMatteDeliveryMode) {
-    AVCamPortraitEffectsMatteDeliveryModeOn,
-    AVCamPortraitEffectsMatteDeliveryModeOff
 };
 
 typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
@@ -71,7 +61,10 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
 
 @end
 
-@interface AVCamCameraViewController () <AVCaptureFileOutputRecordingDelegate, ItemSelectionViewControllerDelegate>
+@interface AVCamCameraViewController () <AVCaptureFileOutputRecordingDelegate, AVCapturePhotoOutputReadinessCoordinatorDelegate>
+{
+    UIInterfaceOrientationMask _supportedInterfaceOrientations;
+}
 
 // Session management.
 @property (nonatomic, weak) IBOutlet AVCamPreviewView* previewView;
@@ -87,24 +80,21 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
 @property (nonatomic, weak) IBOutlet UIButton* cameraButton;
 @property (nonatomic, weak) IBOutlet UILabel* cameraUnavailableLabel;
 @property (nonatomic) AVCaptureDeviceDiscoverySession* videoDeviceDiscoverySession;
+@property (nonatomic) AVCaptureDeviceRotationCoordinator* videoDeviceRotationCoordinator;
 
 // Capturing photos.
 @property (nonatomic, weak) IBOutlet UIButton* photoButton;
 @property (nonatomic, weak) IBOutlet UIButton* livePhotoModeButton;
 @property (nonatomic) AVCamLivePhotoMode livePhotoMode;
 @property (nonatomic, weak) IBOutlet UILabel* capturingLivePhotoLabel;
-@property (nonatomic, weak) IBOutlet UIButton* depthDataDeliveryButton;
-@property (nonatomic) AVCamDepthDataDeliveryMode depthDataDeliveryMode;
-@property (nonatomic, weak) IBOutlet UIButton* portraitEffectsMatteDeliveryButton;
-@property (nonatomic) AVCamPortraitEffectsMatteDeliveryMode portraitEffectsMatteDeliveryMode;
 @property (nonatomic, weak) IBOutlet UISegmentedControl *photoQualityPrioritizationSegControl;
 @property (nonatomic) AVCapturePhotoQualityPrioritization photoQualityPrioritizationMode;
-@property (weak, nonatomic) IBOutlet UIButton *semanticSegmentationMatteDeliveryButton;
 @property (nonatomic, weak) IBOutlet UIButton* HDRVideoModeButton;
 @property (nonatomic) AVCamHDRVideoMode HDRVideoMode;
+@property (nonatomic) AVCapturePhotoOutputReadinessCoordinator* photoOutputReadinessCoordinator;
+@property (nonatomic) AVCapturePhotoSettings* photoSettings;
 
 @property (nonatomic) AVCapturePhotoOutput* photoOutput;
-@property (nonatomic) NSArray<AVSemanticSegmentationMatteType>* selectedSemanticSegmentationMatteTypes;
 @property (nonatomic) NSMutableDictionary<NSNumber* , AVCamPhotoCaptureDelegate* >* inProgressPhotoCaptureDelegates;
 @property (nonatomic) NSInteger inProgressLivePhotoCapturesCount;
 
@@ -118,11 +108,20 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
 @property (nonatomic) UIBackgroundTaskIdentifier backgroundRecordingID;
 @property (nonatomic) AVCaptureDeviceFormat *selectedMovieMode10BitDeviceFormat;
 
+@property (nonatomic, readwrite) UIInterfaceOrientationMask supportedInterfaceOrientations;
 
-@property (nonatomic, retain) UIActivityIndicatorView *spinner;
 @end
 
 @implementation AVCamCameraViewController
+
+- (instancetype) initWithNibName:(NSString *)nibNameOrNil bundle:(NSBundle *)nibBundleOrNil
+{
+    self = [super initWithNibName:nibNameOrNil bundle:nibBundleOrNil];
+    if (self) {
+        _supportedInterfaceOrientations = UIInterfaceOrientationMaskAll;
+    }
+    return self;
+}
 
 #pragma mark View Controller Life Cycle
 
@@ -136,9 +135,6 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
     self.photoButton.enabled = NO;
     self.livePhotoModeButton.enabled = NO;
     self.captureModeControl.enabled = NO;
-    self.depthDataDeliveryButton.enabled = NO;
-    self.portraitEffectsMatteDeliveryButton.enabled = NO;
-	self.semanticSegmentationMatteDeliveryButton.enabled = NO;
     self.photoQualityPrioritizationSegControl.enabled = NO;
     self.HDRVideoModeButton.hidden = YES;
     
@@ -146,7 +142,7 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
     self.session = [[AVCaptureSession alloc] init];
     
     // Create a device discovery session.
-    NSArray<AVCaptureDeviceType>* deviceTypes = @[AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeBuiltInDualCamera, AVCaptureDeviceTypeBuiltInTrueDepthCamera, AVCaptureDeviceTypeBuiltInDualWideCamera];
+    NSArray<AVCaptureDeviceType>* deviceTypes = @[AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeBuiltInDualCamera, AVCaptureDeviceTypeBuiltInTrueDepthCamera];
     self.videoDeviceDiscoverySession = [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:deviceTypes mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionUnspecified];
     
     // Set up the preview view.
@@ -157,7 +153,8 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
     
     self.setupResult = AVCamSetupResultSuccess;
     
-    // Request location authorization so photos and videos can be tagged with their location.
+    // Request location authorization so photos and videos can be tagged with
+    // their location.
     self.locationManager = [[CLLocationManager alloc] init];
     if (self.locationManager.authorizationStatus == kCLAuthorizationStatusNotDetermined) {
         [self.locationManager requestWhenInUseAuthorization];
@@ -215,11 +212,6 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
     dispatch_async(self.sessionQueue, ^{
         [self configureSession];
     });
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
-        self.spinner.color = [UIColor yellowColor];
-        [self.previewView addSubview:self.spinner];
-    });
 }
 
 - (void) viewWillAppear:(BOOL)animated
@@ -231,7 +223,8 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
         {
             case AVCamSetupResultSuccess:
             {
-                // Only setup observers and start the session running if setup succeeded.
+                // Only setup observers and start the session running if setup
+                // succeeded.
                 [self addObservers];
                 [self.session startRunning];
                 self.sessionRunning = self.session.isRunning;
@@ -280,31 +273,14 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
     [super viewDidDisappear:animated];
 }
 
-- (BOOL) shouldAutorotate
+- (UIInterfaceOrientationMask) supportedInterfaceOrientations
 {
-    // Disable autorotation of the interface when recording is in progress.
-    return !self.movieFileOutput.isRecording;
+    return _supportedInterfaceOrientations;
 }
 
-- (UIInterfaceOrientation)windowOrientation {
-    return self.view.window.windowScene.interfaceOrientation;
-}
-
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations
+- (void) setSupportedInterfaceOrientations:(UIInterfaceOrientationMask)supportedInterfaceOrientations
 {
-    return UIInterfaceOrientationMaskAll;
-}
-
-- (void) viewWillTransitionToSize:(CGSize)size
-        withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator
-{
-    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
-    
-    UIDeviceOrientation deviceOrientation = [UIDevice currentDevice].orientation;
-    
-    if (UIDeviceOrientationIsPortrait(deviceOrientation) || UIDeviceOrientationIsLandscape(deviceOrientation)) {
-        self.previewView.videoPreviewLayer.connection.videoOrientation = (AVCaptureVideoOrientation)deviceOrientation;
-    }
+    _supportedInterfaceOrientations = supportedInterfaceOrientations;
 }
 
 #pragma mark Session Management
@@ -320,28 +296,25 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
     
     [self.session beginConfiguration];
     
-    /*
-     We do not create an AVCaptureMovieFileOutput when setting up the session because
-     Live Photo is not supported when AVCaptureMovieFileOutput is added to the session.
-    */
+    // We do not create an AVCaptureMovieFileOutput when setting up the session
+    // because Live Photo is not supported when AVCaptureMovieFileOutput is
+    // added to the session.
     self.session.sessionPreset = AVCaptureSessionPresetPhoto;
     
-    // Add video input.
+    // Handle the situation when the system-preferred camera is nil.
+    AVCaptureDevice *videoDevice = AVCaptureDevice.systemPreferredCamera;
     
-    // Choose the back dual camera if available, otherwise default to a wide angle camera.
-    AVCaptureDevice* videoDevice = [AVCaptureDevice defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInDualCamera mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionBack];
-    if (!videoDevice) {
-        // If a rear dual camera is not available, default to the rear dual wide angle camera.
-        videoDevice = [AVCaptureDevice defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInDualWideCamera mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionBack];
+    NSUserDefaults *userDefaults = NSUserDefaults.standardUserDefaults;
+    if (![userDefaults boolForKey:@"setInitialUserPreferredCamera"] || !videoDevice) {
+        AVCaptureDeviceDiscoverySession *backVideoDeviceDiscoverySession = [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInDualCamera, AVCaptureDeviceTypeBuiltInWideAngleCamera] mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionBack];
+        
+        videoDevice = backVideoDeviceDiscoverySession.devices.firstObject;
+        
+        AVCaptureDevice.userPreferredCamera = videoDevice;
+        
+        [userDefaults setBool:YES forKey:@"setInitialUserPreferredCamera"];
     }
-    if (!videoDevice) {
-        // If a rear dual wide camera is not available, default to the rear wide angle camera.
-        videoDevice = [AVCaptureDevice defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInWideAngleCamera mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionBack];
-    }
-    if (!videoDevice) {
-        // If a rear wide angle camera is not available, default to the front wide angle camera.
-        videoDevice = [AVCaptureDevice defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInWideAngleCamera mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionFront];
-    }
+    
     AVCaptureDeviceInput* videoDeviceInput = [AVCaptureDeviceInput deviceInputWithDevice:videoDevice error:&error];
     if (!videoDeviceInput) {
         NSLog(@"Could not create video device input: %@", error);
@@ -349,26 +322,21 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
         [self.session commitConfiguration];
         return;
     }
+    
+    [AVCaptureDevice addObserver:self forKeyPath:@"systemPreferredCamera" options:NSKeyValueObservingOptionNew context:SystemPreferredCameraContext];
+    
     if ([self.session canAddInput:videoDeviceInput]) {
         [self.session addInput:videoDeviceInput];
         self.videoDeviceInput = videoDeviceInput;
         
         dispatch_async(dispatch_get_main_queue(), ^{
-            /*
-             Dispatch video streaming to the main queue because AVCaptureVideoPreviewLayer is the backing layer for PreviewView.
-             You can manipulate UIView only on the main thread.
-             Note: As an exception to the above rule, it is not necessary to serialize video orientation changes
-             on the AVCaptureVideoPreviewLayer’s connection with other session manipulation.
-             
-             Use the status bar orientation as the initial video orientation. Subsequent orientation changes are
-             handled by CameraViewController.viewWillTransition(to:with:).
-            */
-            AVCaptureVideoOrientation initialVideoOrientation = AVCaptureVideoOrientationPortrait;
-            if (self.windowOrientation != UIInterfaceOrientationUnknown) {
-                initialVideoOrientation = (AVCaptureVideoOrientation)self.windowOrientation;
-            }
-            
-            self.previewView.videoPreviewLayer.connection.videoOrientation = initialVideoOrientation;
+            // Dispatch video streaming to the main queue because
+            // AVCaptureVideoPreviewLayer is the backing layer for PreviewView.
+            // You can manipulate UIView only on the main thread. Note: As an
+            // exception to the above rule, it is not necessary to serialize
+            // video orientation changes on the AVCaptureVideoPreviewLayer’s
+            // connection with other session manipulation.
+            [self createDeviceRotationCoordinator];
         });
     }
     else {
@@ -397,21 +365,19 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
         [self.session addOutput:photoOutput];
         self.photoOutput = photoOutput;
         
-        self.photoOutput.highResolutionCaptureEnabled = YES;
-        self.photoOutput.livePhotoCaptureEnabled = self.photoOutput.livePhotoCaptureSupported;
-        self.photoOutput.depthDataDeliveryEnabled = self.photoOutput.depthDataDeliverySupported;
-        self.photoOutput.portraitEffectsMatteDeliveryEnabled = self.photoOutput.portraitEffectsMatteDeliverySupported;
-		self.photoOutput.enabledSemanticSegmentationMatteTypes = self.photoOutput.availableSemanticSegmentationMatteTypes;
-        self.selectedSemanticSegmentationMatteTypes = self.photoOutput.enabledSemanticSegmentationMatteTypes;
-        self.photoOutput.maxPhotoQualityPrioritization = AVCapturePhotoQualityPrioritizationQuality;
-        
         self.livePhotoMode = self.photoOutput.livePhotoCaptureSupported ? AVCamLivePhotoModeOn : AVCamLivePhotoModeOff;
-        self.depthDataDeliveryMode = self.photoOutput.depthDataDeliverySupported ? AVCamDepthDataDeliveryModeOn : AVCamDepthDataDeliveryModeOff;
-        self.portraitEffectsMatteDeliveryMode = self.photoOutput.portraitEffectsMatteDeliverySupported ? AVCamPortraitEffectsMatteDeliveryModeOn : AVCamPortraitEffectsMatteDeliveryModeOff;
         self.photoQualityPrioritizationMode = AVCapturePhotoQualityPrioritizationBalanced;
         
         self.inProgressPhotoCaptureDelegates = [NSMutableDictionary dictionary];
         self.inProgressLivePhotoCapturesCount = 0;
+
+        [self configurePhotoOutput];
+    
+        AVCapturePhotoOutputReadinessCoordinator *readinessCoordinator = [[AVCapturePhotoOutputReadinessCoordinator alloc] initWithPhotoOutput:photoOutput];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.photoOutputReadinessCoordinator = readinessCoordinator;
+            readinessCoordinator.delegate = self;
+        });
     }
     else {
         NSLog(@"Could not add photo output to the session");
@@ -429,13 +395,13 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
 - (IBAction) resumeInterruptedSession:(id)sender
 {
     dispatch_async(self.sessionQueue, ^{
-        /*
-         The session might fail to start running, e.g., if a phone or FaceTime call is still
-         using audio or video. A failure to start the session running will be communicated via
-         a session runtime error notification. To avoid repeatedly failing to start the session
-         running, we only try to restart the session running in the session runtime error handler
-         if we aren't trying to resume the session running.
-        */
+        // The session might fail to start running, e.g., if a phone or FaceTime
+        // call is still using audio or video. A failure to start the session
+        // running will be communicated via a session runtime error
+        // notification. To avoid repeatedly failing to start the session
+        // running, we only try to restart the session running in the session
+        // runtime error handler if we aren't trying to resume the
+        // session running.
         [self.session startRunning];
         self.sessionRunning = self.session.isRunning;
         if (!self.session.isRunning) {
@@ -464,13 +430,13 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
     Float64 activeMaxFrameRate = activeFormat.videoSupportedFrameRateRanges.lastObject.maxFrameRate;
     FourCharCode activePixelFormat = CMFormatDescriptionGetMediaSubType(activeFormat.formatDescription);
     
-    /*
-     AVCaptureDeviceFormats are sorted from smallest to largest in resolution and frame rate.
-     For each resolution and max frame rate there's a cluster of formats that only differ in pixelFormatType.
-     Here, we're looking for an 'x420' variant of the current activeFormat.
-    */
+    // AVCaptureDeviceFormats are sorted from smallest to largest in resolution
+    // and frame rate. For each resolution and max frame rate there's a cluster
+    // of formats that only differ in pixelFormatType. Here, we're looking for
+    // an 'x420' variant of the current activeFormat.
     if (activePixelFormat != kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) {
-        // Current activeFormat is not a 10-bit HDR format, find its 10-bit HDR variant.
+        // Current activeFormat is not a 10-bit HDR format, find its 10-bit HDR
+        // variant.
         for (NSUInteger index = formatIndex + 1; index < formats.count; index++) {
             AVCaptureDeviceFormat *format = formats[index];
             CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
@@ -503,54 +469,21 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
         self.selectedMovieMode10BitDeviceFormat = nil;
         
         dispatch_async(self.sessionQueue, ^{
-            /*
-             Remove the AVCaptureMovieFileOutput from the session because Live Photo
-             capture is not supported when an AVCaptureMovieFileOutput is connected to the session.
-            */
+            // Remove the AVCaptureMovieFileOutput from the session because Live
+            // Photo capture is not supported when an AVCaptureMovieFileOutput
+            // is connected to the session.
             [self.session beginConfiguration];
             [self.session removeOutput:self.movieFileOutput];
             self.session.sessionPreset = AVCaptureSessionPresetPhoto;
             
             self.movieFileOutput = nil;
             
-            if (self.photoOutput.livePhotoCaptureSupported) {
-                self.photoOutput.livePhotoCaptureEnabled = YES;
-                
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    self.livePhotoModeButton.enabled = YES;
-                });
-            }
-            
-            if (self.photoOutput.depthDataDeliverySupported) {
-                self.photoOutput.depthDataDeliveryEnabled = YES;
-                
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    self.depthDataDeliveryButton.enabled = YES;
-                });
-            }
-            
-            if (self.photoOutput.portraitEffectsMatteDeliverySupported) {
-                self.photoOutput.portraitEffectsMatteDeliveryEnabled = YES;
-                
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    self.portraitEffectsMatteDeliveryButton.enabled = YES;
-                });
-            }
-			
-			if (self.photoOutput.availableSemanticSegmentationMatteTypes.count > 0) {
-				self.photoOutput.enabledSemanticSegmentationMatteTypes = self.photoOutput.availableSemanticSegmentationMatteTypes;
-				self.selectedSemanticSegmentationMatteTypes = self.photoOutput.availableSemanticSegmentationMatteTypes;
-				
-				dispatch_async(dispatch_get_main_queue(), ^{
-					self.semanticSegmentationMatteDeliveryButton.enabled = (self.depthDataDeliveryMode == AVCamDepthDataDeliveryModeOn) ? YES : NO;
-				});
-			}
+            [self configurePhotoOutput];
+            BOOL livePhotoCaptureEnabled = self.photoOutput.livePhotoCaptureEnabled;
             
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.livePhotoModeButton.hidden = NO;
-                self.depthDataDeliveryButton.hidden = NO;
-                self.portraitEffectsMatteDeliveryButton.hidden = NO;
-                self.semanticSegmentationMatteDeliveryButton.hidden = NO;
+                self.livePhotoModeButton.enabled = livePhotoCaptureEnabled;
                 self.photoQualityPrioritizationSegControl.hidden = NO;
                 self.photoQualityPrioritizationSegControl.enabled = YES;
             });
@@ -560,9 +493,6 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
     }
     else if (captureModeControl.selectedSegmentIndex == AVCamCaptureModeMovie) {
         self.livePhotoModeButton.hidden = YES;
-        self.depthDataDeliveryButton.hidden = YES;
-        self.portraitEffectsMatteDeliveryButton.hidden = YES;
-		self.semanticSegmentationMatteDeliveryButton.hidden = YES;
         self.photoQualityPrioritizationSegControl.hidden = YES;
         
         dispatch_async(self.sessionQueue, ^{
@@ -606,10 +536,9 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     self.recordButton.enabled = YES;
                     
-                    /*
-                     For photo captures during movie recording, Balanced quality photo processing is prioritized
-                     to get high quality stills and avoid frame drops during recording.
-                     */
+                    // For photo captures during movie recording, Balanced
+                    // quality photo processing is prioritized to get high
+                    // quality stills and avoid frame drops during recording.
                     self.photoQualityPrioritizationSegControl.selectedSegmentIndex = 1;
                     [self.photoQualityPrioritizationSegControl sendActionsForControlEvents:UIControlEventValueChanged];
                 });
@@ -618,50 +547,93 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
     }
 }
 
+- (void) configurePhotoOutput
+{
+    NSArray<NSValue *> *supportedMaxPhotoDimensions = self.videoDeviceInput.device.activeFormat.supportedMaxPhotoDimensions;
+    CMVideoDimensions largestDimension = supportedMaxPhotoDimensions.lastObject.CMVideoDimensionsValue;
+    self.photoOutput.maxPhotoDimensions = largestDimension;
+    self.photoOutput.livePhotoCaptureEnabled = self.photoOutput.livePhotoCaptureSupported;
+    self.photoOutput.maxPhotoQualityPrioritization = AVCapturePhotoQualityPrioritizationQuality;
+    self.photoOutput.responsiveCaptureEnabled = self.photoOutput.responsiveCaptureSupported;
+    self.photoOutput.fastCapturePrioritizationEnabled = self.photoOutput.fastCapturePrioritizationSupported;
+    self.photoOutput.autoDeferredPhotoDeliveryEnabled = self.photoOutput.autoDeferredPhotoDeliverySupported;
+    
+    AVCapturePhotoSettings *photoSettings = [self setUpPhotoSettings];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.photoSettings = photoSettings;
+    });
+}
+
 #pragma mark Device Configuration
 
-- (IBAction) changeCamera:(id)sender
+- (IBAction) changeCameraButtonPressed:(id)sender
 {
     self.cameraButton.enabled = NO;
     self.recordButton.enabled = NO;
     self.photoButton.enabled = NO;
     self.livePhotoModeButton.enabled = NO;
     self.captureModeControl.enabled = NO;
-    self.depthDataDeliveryButton.enabled = NO;
-    self.portraitEffectsMatteDeliveryButton.enabled = NO;
-    self.semanticSegmentationMatteDeliveryButton.enabled = NO;
     self.photoQualityPrioritizationSegControl.enabled = NO;
     self.HDRVideoModeButton.enabled = NO;
     self.selectedMovieMode10BitDeviceFormat = nil;
     
+    [self changeCamera:nil isUserSelection:YES completion:^{
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.cameraButton.enabled = YES;
+            self.recordButton.enabled = self.captureModeControl.selectedSegmentIndex == AVCamCaptureModeMovie;
+            self.photoButton.enabled = YES;
+            self.livePhotoModeButton.enabled = YES;
+            self.captureModeControl.enabled = YES;
+            self.photoQualityPrioritizationSegControl.enabled = YES;
+        });
+    }];
+}
+ 
+- (void)changeCamera:(AVCaptureDevice *)videoDevice isUserSelection:(BOOL)isUserSelection completion:(dispatch_block_t)completion
+{
     dispatch_async(self.sessionQueue, ^{
         AVCaptureDevice* currentVideoDevice = self.videoDeviceInput.device;
-        AVCaptureDevicePosition currentPosition = currentVideoDevice.position;
-        
-        AVCaptureDeviceDiscoverySession *backVideoDeviceDiscoverySession = [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInDualCamera, AVCaptureDeviceTypeBuiltInDualWideCamera, AVCaptureDeviceTypeBuiltInWideAngleCamera] mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionBack];
-        AVCaptureDeviceDiscoverySession *frontVideoDeviceDiscoverySession = [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInTrueDepthCamera, AVCaptureDeviceTypeBuiltInDualWideCamera] mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionFront];
-        
         AVCaptureDevice *newVideoDevice = nil;
-        switch (currentPosition)
-        {
-            case AVCaptureDevicePositionUnspecified:
-            case AVCaptureDevicePositionFront:
-                newVideoDevice = backVideoDeviceDiscoverySession.devices.firstObject;
-                break;
-            case AVCaptureDevicePositionBack:
-                newVideoDevice = frontVideoDeviceDiscoverySession.devices.firstObject;
-                break;
-            default:
-                NSLog(@"Unknown capture position. Defaulting to back, dual-camera.");
-                newVideoDevice = [AVCaptureDevice defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInDualCamera mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionBack];
+        
+        if (videoDevice) {
+            newVideoDevice = videoDevice;
+        }
+        else {
+            AVCaptureDevicePosition currentPosition = currentVideoDevice.position;
+            
+            AVCaptureDeviceDiscoverySession *backVideoDeviceDiscoverySession = [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInDualCamera, AVCaptureDeviceTypeBuiltInWideAngleCamera] mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionBack];
+            AVCaptureDeviceDiscoverySession *frontVideoDeviceDiscoverySession = [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInTrueDepthCamera, AVCaptureDeviceTypeBuiltInWideAngleCamera] mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionFront];
+            AVCaptureDeviceDiscoverySession *externalVideoDeviceDiscoverySession = [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeExternal] mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionUnspecified];
+            
+            switch (currentPosition)
+            {
+                case AVCaptureDevicePositionUnspecified:
+                case AVCaptureDevicePositionFront:
+                    newVideoDevice = backVideoDeviceDiscoverySession.devices.firstObject;
+                    break;
+                case AVCaptureDevicePositionBack:
+                    if (externalVideoDeviceDiscoverySession.devices.count > 0) {
+                        newVideoDevice = externalVideoDeviceDiscoverySession.devices.firstObject;
+                    }
+                    else {
+                        newVideoDevice = frontVideoDeviceDiscoverySession.devices.firstObject;
+                    }
+                    break;
+                default:
+                    NSLog(@"Unknown capture position. Defaulting to back, dual-camera.");
+                    newVideoDevice = [AVCaptureDevice defaultDeviceWithDeviceType:AVCaptureDeviceTypeBuiltInDualCamera mediaType:AVMediaTypeVideo position:AVCaptureDevicePositionBack];
+            }
         }
 
-        if (newVideoDevice) {
+        if (newVideoDevice && (newVideoDevice != self.videoDeviceInput.device)) {
+            
             AVCaptureDeviceInput* videoDeviceInput = [AVCaptureDeviceInput deviceInputWithDevice:newVideoDevice error:NULL];
             
             [self.session beginConfiguration];
             
-            // Remove the existing device input first, since using the front and back camera simultaneously is not supported.
+            // Remove the existing device input first, because using the front
+            // and back camera simultaneously is not supported.
             [self.session removeInput:self.videoDeviceInput];
             
             if ([self.session canAddInput:videoDeviceInput]) {
@@ -671,6 +643,14 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
                 
                 [self.session addInput:videoDeviceInput];
                 self.videoDeviceInput = videoDeviceInput;
+                
+                if (isUserSelection) {
+                    AVCaptureDevice.userPreferredCamera = newVideoDevice;
+                }
+				
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self createDeviceRotationCoordinator];
+                });
             }
             else {
                 [self.session addInput:self.videoDeviceInput];
@@ -705,34 +685,28 @@ typedef NS_ENUM(NSInteger, AVCamHDRVideoMode) {
                 }
             }
             
-            /*
-             Set Live Photo capture and depth data delivery if it is supported. When changing cameras, the
-             `livePhotoCaptureEnabled` and `depthDataDeliveryEnabled` properties of the AVCapturePhotoOutput gets set to NO when
-             a video device is disconnected from the session. After the new video device is
-             added to the session, re-enable Live Photo capture and depth data delivery if they are supported.
-            */
-            self.photoOutput.livePhotoCaptureEnabled = self.photoOutput.livePhotoCaptureSupported;
-            self.photoOutput.depthDataDeliveryEnabled = self.photoOutput.depthDataDeliverySupported;
-            self.photoOutput.portraitEffectsMatteDeliveryEnabled = self.photoOutput.portraitEffectsMatteDeliverySupported;
-            self.photoOutput.enabledSemanticSegmentationMatteTypes = self.photoOutput.availableSemanticSegmentationMatteTypes;
-            self.selectedSemanticSegmentationMatteTypes = self.photoOutput.availableSemanticSegmentationMatteTypes;
-            self.photoOutput.maxPhotoQualityPrioritization = AVCapturePhotoQualityPrioritizationQuality;
+            // `livePhotoCaptureEnabled` and other properties of the
+            // `AVCapturePhotoOutput` are `NO` when a video device disconnects
+            // from the session. After the session acquires a new video device,
+            // you need to reconfigure the photo output to enable those
+            // properties, if applicable.
+            [self configurePhotoOutput];
             
             [self.session commitConfiguration];
         }
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.cameraButton.enabled = YES;
-            self.recordButton.enabled = self.captureModeControl.selectedSegmentIndex == AVCamCaptureModeMovie;
-            self.photoButton.enabled = YES;
-            self.livePhotoModeButton.enabled = YES;
-            self.captureModeControl.enabled = YES;
-            self.depthDataDeliveryButton.enabled = self.photoOutput.isDepthDataDeliveryEnabled;
-            self.portraitEffectsMatteDeliveryButton.enabled = self.photoOutput.isPortraitEffectsMatteDeliveryEnabled;
-            self.semanticSegmentationMatteDeliveryButton.enabled = (self.photoOutput.availableSemanticSegmentationMatteTypes.count > 0 && self.depthDataDeliveryMode == AVCamDepthDataDeliveryModeOn) ? YES : NO;
-            self.photoQualityPrioritizationSegControl.enabled = YES;
-        });
+
+        if (completion) {
+            completion();
+        }
     });
+}
+
+- (void)createDeviceRotationCoordinator
+{
+    self.videoDeviceRotationCoordinator = [[AVCaptureDeviceRotationCoordinator alloc] initWithDevice:self.videoDeviceInput.device previewLayer:self.previewView.videoPreviewLayer];
+    self.previewView.videoPreviewLayer.connection.videoRotationAngle = self.videoDeviceRotationCoordinator.videoRotationAngleForHorizonLevelPreview;
+    
+    [self.videoDeviceRotationCoordinator addObserver:self forKeyPath:@"videoRotationAngleForHorizonLevelPreview" options:NSKeyValueObservingOptionNew context:VideoRotationAngleForHorizonLevelPreviewContext];
 }
 
 - (IBAction) focusAndExposeTap:(UIGestureRecognizer*)gestureRecognizer
@@ -750,10 +724,10 @@ monitorSubjectAreaChange:(BOOL)monitorSubjectAreaChange
         AVCaptureDevice* device = self.videoDeviceInput.device;
         NSError* error = nil;
         if ([device lockForConfiguration:&error]) {
-            /*
-             Setting (focus/exposure)PointOfInterest alone does not initiate a (focus/exposure) operation.
-             Call set(Focus/Exposure)Mode() to apply the new point of interest.
-            */
+            // Setting (focus/exposure)PointOfInterest alone does not initiate a
+            // (focus/exposure) operation.
+            // Call set(Focus/Exposure)Mode() to apply the new point of
+            // interest.
             if (device.isFocusPointOfInterestSupported && [device isFocusModeSupported:focusMode]) {
                 device.focusPointOfInterest = point;
                 device.focusMode = focusMode;
@@ -773,56 +747,49 @@ monitorSubjectAreaChange:(BOOL)monitorSubjectAreaChange
     });
 }
 
+#pragma mark Readiness Coordinator
+
+- (void) readinessCoordinator:(AVCapturePhotoOutputReadinessCoordinator *)coordinator captureReadinessDidChange:(AVCapturePhotoOutputCaptureReadiness)captureReadiness
+{
+    // Enable user interaction for the shutter button only when the output is
+    // ready to capture.
+    self.photoButton.userInteractionEnabled = (captureReadiness == AVCapturePhotoOutputCaptureReadinessReady) ? YES : NO;
+    
+    // Note: You can customize the shutter button's appearance based on
+    // `captureReadiness`.
+}
+
 #pragma mark Capturing Photos
 
 - (IBAction) capturePhoto:(id)sender
 {
-    /*
-     Retrieve the video preview layer's video orientation on the main queue before
-     entering the session queue. We do this to ensure UI elements are accessed on
-     the main thread and session configuration is done on the session queue.
-    */
-    AVCaptureVideoOrientation videoPreviewLayerVideoOrientation = self.previewView.videoPreviewLayer.connection.videoOrientation;
+    if (self.photoSettings == nil) {
+        NSLog(@"No photo settings to capture");
+        return;
+    }
+    
+    // Create a unique settings object for this request.
+    AVCapturePhotoSettings* photoSettings = [AVCapturePhotoSettings photoSettingsFromPhotoSettings:self.photoSettings];
+
+    // Provide a unique temporary URL because Live Photo captures can overlap.
+    if (photoSettings.livePhotoMovieFileURL) {
+        photoSettings.livePhotoMovieFileURL = [self livePhotoMovieUniqueTemporaryDirectoryFileURL];
+    }
+    
+    // Start tracking capture readiness on the main thread to synchronously
+    // update the shutter button's availability and appearance to include this
+    // request.
+    [self.photoOutputReadinessCoordinator startTrackingCaptureRequestUsingPhotoSettings:photoSettings];
+    
+    CGFloat videoRotationAngle = self.videoDeviceRotationCoordinator.videoRotationAngleForHorizonLevelCapture;
     
     dispatch_async(self.sessionQueue, ^{
         
-        // Update the photo output's connection to match the video orientation of the video preview layer.
         AVCaptureConnection* photoOutputConnection = [self.photoOutput connectionWithMediaType:AVMediaTypeVideo];
-        photoOutputConnection.videoOrientation = videoPreviewLayerVideoOrientation;
+        photoOutputConnection.videoRotationAngle = videoRotationAngle;
         
-        AVCapturePhotoSettings* photoSettings;
-        // Capture HEIF photos when supported, with the flash set to enable auto- and high-resolution photos.
-        if ([self.photoOutput.availablePhotoCodecTypes containsObject:AVVideoCodecTypeHEVC]) {
-            photoSettings = [AVCapturePhotoSettings photoSettingsWithFormat:@{ AVVideoCodecKey : AVVideoCodecTypeHEVC }];
-        }
-        else {
-            photoSettings = [AVCapturePhotoSettings photoSettings];
-        }
-        
-        if (self.videoDeviceInput.device.isFlashAvailable) {
-            photoSettings.flashMode = AVCaptureFlashModeAuto;
-        }
-        photoSettings.highResolutionPhotoEnabled = YES;
-        if (photoSettings.availablePreviewPhotoPixelFormatTypes.count > 0) {
-            photoSettings.previewPhotoFormat = @{ (NSString*)kCVPixelBufferPixelFormatTypeKey : photoSettings.availablePreviewPhotoPixelFormatTypes.firstObject };
-        }
-        if (self.livePhotoMode == AVCamLivePhotoModeOn && self.photoOutput.livePhotoCaptureSupported) { // Live Photo capture is not supported in movie mode.
-            NSString* livePhotoMovieFileName = [NSUUID UUID].UUIDString;
-            NSString* livePhotoMovieFilePath = [NSTemporaryDirectory() stringByAppendingPathComponent:[livePhotoMovieFileName stringByAppendingPathExtension:@"mov"]];
-            photoSettings.livePhotoMovieFileURL = [NSURL fileURLWithPath:livePhotoMovieFilePath];
-        }
-        
-        photoSettings.depthDataDeliveryEnabled = (self.depthDataDeliveryMode == AVCamDepthDataDeliveryModeOn && self.photoOutput.isDepthDataDeliveryEnabled);
-        
-        photoSettings.portraitEffectsMatteDeliveryEnabled = (self.portraitEffectsMatteDeliveryMode == AVCamPortraitEffectsMatteDeliveryModeOn && self.photoOutput.isPortraitEffectsMatteDeliveryEnabled);
-		
-		if (photoSettings.depthDataDeliveryEnabled && self.photoOutput.availableSemanticSegmentationMatteTypes.count > 0) {
-            photoSettings.enabledSemanticSegmentationMatteTypes = self.selectedSemanticSegmentationMatteTypes;
-		}
-		
-        photoSettings.photoQualityPrioritization = self.photoQualityPrioritizationMode;
-        
-        // Use a separate object for the photo capture delegate to isolate each capture life cycle.
+        // Use a separate object for the photo capture delegate to isolate each
+        // capture life cycle.
         AVCamPhotoCaptureDelegate* photoCaptureDelegate = [[AVCamPhotoCaptureDelegate alloc] initWithRequestedPhotoSettings:photoSettings willCapturePhotoAnimation:^{
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.previewView.videoPreviewLayer.opacity = 0.0;
@@ -831,11 +798,9 @@ monitorSubjectAreaChange:(BOOL)monitorSubjectAreaChange
                 }];
             });
         } livePhotoCaptureHandler:^(BOOL capturing) {
-            /*
-             Because Live Photo captures can overlap, we need to keep track of the
-             number of in progress Live Photo captures to ensure that the
-             Live Photo label stays visible during these captures.
-            */
+            // Because Live Photo captures can overlap, we need to keep track of
+            // the number of in progress Live Photo captures to ensure that the
+            // Live Photo label stays visible during these captures.
             dispatch_async(self.sessionQueue, ^{
                 if (capturing) {
                     self.inProgressLivePhotoCapturesCount++;
@@ -858,36 +823,66 @@ monitorSubjectAreaChange:(BOOL)monitorSubjectAreaChange
                 });
             });
         } completionHandler:^(AVCamPhotoCaptureDelegate* photoCaptureDelegate) {
-            // When the capture is complete, remove a reference to the photo capture delegate so it can be deallocated.
+            // When the capture is complete, remove a reference to the photo
+            // capture delegate so it can be deallocated.
             dispatch_async(self.sessionQueue, ^{
                 self.inProgressPhotoCaptureDelegates[@(photoCaptureDelegate.requestedPhotoSettings.uniqueID)] = nil;
-            });
-        } photoProcessingHandler:^(BOOL animate) {
-            // Animates a spinner while photo is processing
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (animate) {
-                    self.spinner.hidesWhenStopped = YES;
-                    self.spinner.center = CGPointMake(self.previewView.frame.size.width / 2.0, self.previewView.frame.size.height / 2.0);
-                    [self.spinner startAnimating];
-                }
-                else {
-                    [self.spinner stopAnimating];
-                }
             });
         }];
         
         // Specify the location the photo was taken
         photoCaptureDelegate.location = self.locationManager.location;
         
-        /*
-         The Photo Output keeps a weak reference to the photo capture delegate so
-         we store it in an array to maintain a strong reference to this object
-         until the capture is completed.
-        */
+        // The Photo Output keeps a weak reference to the photo capture delegate
+        // so we store it in an array to maintain a strong reference to this
+        // object until the capture is completed.
         self.inProgressPhotoCaptureDelegates[@(photoCaptureDelegate.requestedPhotoSettings.uniqueID)] = photoCaptureDelegate;
         
         [self.photoOutput capturePhotoWithSettings:photoSettings delegate:photoCaptureDelegate];
+    
+        // Stop tracking the capture request because it's now destined for the
+        // photo output.
+        [self.photoOutputReadinessCoordinator stopTrackingCaptureRequestUsingPhotoSettingsUniqueID:photoSettings.uniqueID];
     });
+}
+
+- (AVCapturePhotoSettings *) setUpPhotoSettings
+{
+    AVCapturePhotoSettings* photoSettings;
+    
+    // Capture HEIF photos when supported.
+    if ([self.photoOutput.availablePhotoCodecTypes containsObject:AVVideoCodecTypeHEVC]) {
+        photoSettings = [AVCapturePhotoSettings photoSettingsWithFormat:@{ AVVideoCodecKey : AVVideoCodecTypeHEVC }];
+    }
+    else {
+        photoSettings = [AVCapturePhotoSettings photoSettings];
+    }
+    
+    // Set the flash to auto mode.
+    if (self.videoDeviceInput.device.isFlashAvailable) {
+        photoSettings.flashMode = AVCaptureFlashModeAuto;
+    }
+    
+    // Enable high-resolution photos.
+    photoSettings.maxPhotoDimensions = self.photoOutput.maxPhotoDimensions;
+    if (photoSettings.availablePreviewPhotoPixelFormatTypes.count > 0) {
+        photoSettings.previewPhotoFormat = @{ (NSString*)kCVPixelBufferPixelFormatTypeKey : photoSettings.availablePreviewPhotoPixelFormatTypes.firstObject };
+    }
+    // Live Photo capture is not supported in movie mode.
+    if (self.livePhotoMode == AVCamLivePhotoModeOn && self.photoOutput.livePhotoCaptureSupported) {
+        photoSettings.livePhotoMovieFileURL = [self livePhotoMovieUniqueTemporaryDirectoryFileURL];
+    }
+    
+    photoSettings.photoQualityPrioritization = self.photoQualityPrioritizationMode;
+    
+    return photoSettings;
+}
+
+- (NSURL *)livePhotoMovieUniqueTemporaryDirectoryFileURL
+{
+    NSString* livePhotoMovieFileName = [NSUUID UUID].UUIDString;
+    NSString* livePhotoMovieFilePath = [NSTemporaryDirectory() stringByAppendingPathComponent:[livePhotoMovieFileName stringByAppendingPathExtension:@"mov"]];
+    return [NSURL fileURLWithPath:livePhotoMovieFilePath];
 }
 
 - (IBAction) toggleLivePhotoMode:(UIButton*)livePhotoModeButton
@@ -896,6 +891,9 @@ monitorSubjectAreaChange:(BOOL)monitorSubjectAreaChange
         self.livePhotoMode = (self.livePhotoMode == AVCamLivePhotoModeOn) ? AVCamLivePhotoModeOff : AVCamLivePhotoModeOn;
         AVCamLivePhotoMode livePhotoMode = self.livePhotoMode;
         
+        // Update `photoSettings` to include `livePhotoMode`.
+        AVCapturePhotoSettings *photoSettings = [self setUpPhotoSettings];
+    
         dispatch_async(dispatch_get_main_queue(), ^{
             if (livePhotoMode == AVCamLivePhotoModeOn) {
                 [self.livePhotoModeButton setImage:[UIImage imageNamed:@"LivePhotoON"] forState:UIControlStateNormal];
@@ -903,55 +901,7 @@ monitorSubjectAreaChange:(BOOL)monitorSubjectAreaChange
             else {
                 [self.livePhotoModeButton setImage:[UIImage imageNamed:@"LivePhotoOFF"] forState:UIControlStateNormal];
             }
-        });
-    });
-}
-
-- (IBAction) toggleDepthDataDeliveryMode:(UIButton*)depthDataDeliveryButton
-{
-    dispatch_async(self.sessionQueue, ^{
-        self.depthDataDeliveryMode = (self.depthDataDeliveryMode == AVCamDepthDataDeliveryModeOn) ? AVCamDepthDataDeliveryModeOff : AVCamDepthDataDeliveryModeOn;
-        AVCamDepthDataDeliveryMode depthDataDeliveryMode = self.depthDataDeliveryMode;
-        if (depthDataDeliveryMode == AVCamDepthDataDeliveryModeOn) {
-            self.portraitEffectsMatteDeliveryMode = AVCamPortraitEffectsMatteDeliveryModeOn;
-        }
-        else {
-            self.portraitEffectsMatteDeliveryMode = AVCamPortraitEffectsMatteDeliveryModeOff;
-        }
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (depthDataDeliveryMode == AVCamDepthDataDeliveryModeOn) {
-                [self.depthDataDeliveryButton setImage:[UIImage imageNamed:@"DepthON"] forState:UIControlStateNormal];
-                [self.portraitEffectsMatteDeliveryButton setImage:[UIImage imageNamed:@"PortraitMatteON"] forState:UIControlStateNormal];
-                self.semanticSegmentationMatteDeliveryButton.enabled = YES;
-            }
-            else {
-                [self.depthDataDeliveryButton setImage:[UIImage imageNamed:@"DepthOFF"] forState:UIControlStateNormal];
-                [self.portraitEffectsMatteDeliveryButton setImage:[UIImage imageNamed:@"PortraitMatteOFF"] forState:UIControlStateNormal];
-				self.semanticSegmentationMatteDeliveryButton.enabled = NO;
-            }
-        });
-    });
-}
-
-- (IBAction) togglePortraitEffectsMatteDeliveryMode:(UIButton*)portraitEffectsMatteDeliveryButton
-{
-    dispatch_async(self.sessionQueue, ^{
-        if (self.portraitEffectsMatteDeliveryMode == AVCamPortraitEffectsMatteDeliveryModeOn) {
-            self.portraitEffectsMatteDeliveryMode = AVCamPortraitEffectsMatteDeliveryModeOff;
-        }
-        else {
-            self.portraitEffectsMatteDeliveryMode = (self.depthDataDeliveryMode == AVCamDepthDataDeliveryModeOff) ? AVCamPortraitEffectsMatteDeliveryModeOff : AVCamPortraitEffectsMatteDeliveryModeOn;
-        }
-        AVCamPortraitEffectsMatteDeliveryMode portraitEffectsMatteDeliveryMode = self.portraitEffectsMatteDeliveryMode;
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (portraitEffectsMatteDeliveryMode == AVCamPortraitEffectsMatteDeliveryModeOn) {
-                [self.portraitEffectsMatteDeliveryButton setImage:[UIImage imageNamed:@"PortraitMatteON"] forState:UIControlStateNormal];
-            }
-            else {
-                [self.portraitEffectsMatteDeliveryButton setImage:[UIImage imageNamed:@"PortraitMatteOFF"] forState:UIControlStateNormal];
-            }
+            self.photoSettings = photoSettings;
         });
     });
 }
@@ -973,14 +923,13 @@ monitorSubjectAreaChange:(BOOL)monitorSubjectAreaChange
             default:
                 break;
         }
-
+    
+        // Update `photoSettings` to include `photoQualityPrioritizationMode`.
+        AVCapturePhotoSettings *photoSettings = [self setUpPhotoSettings];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.photoSettings = photoSettings;
+        });
     });
-}
-- (IBAction)toggleSemanticSegmentationMatteDeliveryMode:(UIButton*)semanticSegmentationMatteDeliveryButton
-{
-	ItemSelectionViewController *itemSelectionViewController = [[ItemSelectionViewController alloc]initWithDelegate:self identifier:nil allItems:self.photoOutput.availableSemanticSegmentationMatteTypes selectedItems:self.selectedSemanticSegmentationMatteTypes allowMultipleSelection:YES];
-	
-	[self presentItemSelectionViewController:itemSelectionViewController];
 }
 
 - (IBAction) toggleHDRVideoMode:(UIButton*)HDRVideoModeButton
@@ -1012,24 +961,6 @@ monitorSubjectAreaChange:(BOOL)monitorSubjectAreaChange
     });
 }
 
-- (void) presentItemSelectionViewController:(ItemSelectionViewController *) it
-{
-	UINavigationController *navigationController = [[UINavigationController alloc]initWithRootViewController:it];
-	navigationController.navigationBar.barTintColor = UIColor.blackColor;
-	navigationController.navigationBar.tintColor = self.view.tintColor;
-	
-	[self presentViewController:navigationController animated:YES completion:nil];
-}
-
-#pragma mark ItemSelectionViewControllerDelegate
-
-- (void)itemSelectionViewController:(ItemSelectionViewController *)it didFinishSelectingItems:(NSArray *)selectedItems
-{
-	dispatch_async(self.sessionQueue, ^{
-        self.selectedSemanticSegmentationMatteTypes = selectedItems;
-	});
-}
-
 #pragma mark Recording Movies
 
 - (IBAction) toggleMovieRecording:(id)sender
@@ -1044,32 +975,33 @@ monitorSubjectAreaChange:(BOOL)monitorSubjectAreaChange
     self.recordButton.enabled = NO;
     self.captureModeControl.enabled = NO;
     
-    /*
-     Retrieve the video preview layer's video orientation on the main queue
-     before entering the session queue. We do this to ensure UI elements are
-     accessed on the main thread and session configuration is done on the session queue.
-    */
-    AVCaptureVideoOrientation videoPreviewLayerVideoOrientation = self.previewView.videoPreviewLayer.connection.videoOrientation;
+    CGFloat videoRotationAngle = self.videoDeviceRotationCoordinator.videoRotationAngleForHorizonLevelCapture;
+    
+    // Lock the interface to the current orientation.
+    self.supportedInterfaceOrientations = 1 << self.view.window.windowScene.interfaceOrientation;
+    [self setNeedsUpdateOfSupportedInterfaceOrientations];
     
     dispatch_async(self.sessionQueue, ^{
         if (!self.movieFileOutput.isRecording) {
             if ([UIDevice currentDevice].isMultitaskingSupported) {
-                /*
-                 Setup background task.
-                 This is needed because the -[captureOutput:didFinishRecordingToOutputFileAtURL:fromConnections:error:]
-                 callback is not received until AVCam returns to the foreground unless you request background execution time.
-                 This also ensures that there will be time to write the file to the photo library when AVCam is backgrounded.
-                 To conclude this background execution, -[endBackgroundTask:] is called in
-                 -[captureOutput:didFinishRecordingToOutputFileAtURL:fromConnections:error:] after the recorded file has been saved.
-                */
+                // Setup background task. This is needed because the
+                // -[captureOutput:didFinishRecordingToOutputFileAtURL:fromConnections:error:]
+                // callback is not received until AVCam returns to the
+                // foreground unless you request background execution time. This
+                // also ensures that there will be time to write the file to the
+                // photo library when AVCam is backgrounded. To conclude this
+                // background execution, -[endBackgroundTask:] is called in
+                // -[captureOutput:didFinishRecordingToOutputFileAtURL:fromConnections:error:]
+                // after the recorded file has been saved.
                 self.backgroundRecordingID = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:nil];
             }
             
-            // Update the orientation on the movie file output video connection before starting recording.
+            // Update the orientation on the movie file output video connection
+            // before starting recording.
             AVCaptureConnection* movieFileOutputConnection = [self.movieFileOutput connectionWithMediaType:AVMediaTypeVideo];
-            movieFileOutputConnection.videoOrientation = videoPreviewLayerVideoOrientation;
+            movieFileOutputConnection.videoRotationAngle = videoRotationAngle;
             
-            // Use HEVC codec if supported
+            // Use HEVC codec, if supported.
             if ([self.movieFileOutput.availableVideoCodecTypes containsObject:AVVideoCodecTypeHEVC]) {
                 [self.movieFileOutput setOutputSettings:@{ AVVideoCodecKey : AVVideoCodecTypeHEVC } forConnection:movieFileOutputConnection];
             }
@@ -1102,14 +1034,12 @@ didFinishRecordingToOutputFileAtURL:(NSURL*)outputFileURL
        fromConnections:(NSArray*)connections
                  error:(NSError*)error
 {
-    /*
-     currentBackgroundRecordingID is used to end the background task
-     associated with the current recording. It allows a new recording to be started
-     and associated with a new UIBackgroundTaskIdentifier, once the movie file output's
-     `recording` property is back to NO.
-     Since a unique file path for each recording is used, a new recording will
-     not overwrite a recording currently being saved.
-    */
+    // currentBackgroundRecordingID is used to end the background task
+    // associated with the current recording. It allows a new recording to be
+    // started and associated with a new UIBackgroundTaskIdentifier, once the
+    // movie file output's `recording` property is back to NO. Because a unique
+    // file path for each recording is used, a new recording will not overwrite
+    // a recording currently being saved.
     UIBackgroundTaskIdentifier currentBackgroundRecordingID = self.backgroundRecordingID;
     self.backgroundRecordingID = UIBackgroundTaskInvalid;
     
@@ -1140,7 +1070,7 @@ didFinishRecordingToOutputFileAtURL:(NSURL*)outputFileURL
                     PHAssetCreationRequest* creationRequest = [PHAssetCreationRequest creationRequestForAsset];
                     [creationRequest addResourceWithType:PHAssetResourceTypeVideo fileURL:outputFileURL options:options];
                     
-                    // Specify the location the movie was recorded
+                    // Specify the movie's location.
                     creationRequest.location = self.locationManager.location;
                 } completionHandler:^(BOOL success, NSError* error) {
                     if (!success) {
@@ -1158,13 +1088,27 @@ didFinishRecordingToOutputFileAtURL:(NSURL*)outputFileURL
         cleanUp();
     }
     
-    // Enable the Camera and Record buttons to let the user switch camera and start another recording.
+    // When recording finishes, check if the system-preferred camera changed
+    // during the recording.
+    dispatch_async(self.sessionQueue, ^{
+        AVCaptureDevice *systemPreferredCamera = AVCaptureDevice.systemPreferredCamera;
+        if (self.videoDeviceInput.device != systemPreferredCamera) {
+            [self changeCamera:systemPreferredCamera isUserSelection:NO completion:nil];
+        }
+    });
+    
+    // Enable the Camera and Record buttons to let the user switch camera and
+    // start another recording.
     dispatch_async(dispatch_get_main_queue(), ^{
-        // Only enable the ability to change camera if the device has more than one camera.
+        // Only enable the ability to change camera if the device has more than
+        // one camera.
         self.cameraButton.enabled = (self.videoDeviceDiscoverySession.uniqueDevicePositionsCount > 1);
         self.recordButton.enabled = YES;
         self.captureModeControl.enabled = YES;
         [self.recordButton setImage:[UIImage imageNamed:@"CaptureVideo"] forState:UIControlStateNormal];
+        self.supportedInterfaceOrientations = UIInterfaceOrientationMaskAll;
+        // After the recording finishes, allow rotation to continue.
+        [self setNeedsUpdateOfSupportedInterfaceOrientations];
     });
 }
 
@@ -1173,18 +1117,16 @@ didFinishRecordingToOutputFileAtURL:(NSURL*)outputFileURL
 - (void) addObservers
 {
     [self.session addObserver:self forKeyPath:@"running" options:NSKeyValueObservingOptionNew context:SessionRunningContext];
-    [self addObserver:self forKeyPath:@"videoDeviceInput.device.systemPressureState" options:NSKeyValueObservingOptionNew context:SystemPressureContext];
     
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(subjectAreaDidChange:) name:AVCaptureDeviceSubjectAreaDidChangeNotification object:self.videoDeviceInput.device];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(sessionRuntimeError:) name:AVCaptureSessionRuntimeErrorNotification object:self.session];
     
-    /*
-     A session can only run when the app is full screen. It will be interrupted
-     in a multi-app layout, introduced in iOS 9, see also the documentation of
-     AVCaptureSessionInterruptionReason. Add observers to handle these session
-     interruptions and show a preview is paused message. See the documentation
-     of AVCaptureSessionWasInterruptedNotification for other interruption reasons.
-    */
+    // A session can only run when the app is full screen. It will be
+    // interrupted in a multi-app layout, introduced in iOS 9, see also the
+    // documentation of `AVCaptureSessionInterruptionReason`. Add observers to
+    // handle these session interruptions and show a preview is paused message.
+    // See `AVCaptureSessionWasInterruptedNotification` for other interruption
+    // reasons.
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(sessionWasInterrupted:) name:AVCaptureSessionWasInterruptedNotification object:self.session];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(sessionInterruptionEnded:) name:AVCaptureSessionInterruptionEndedNotification object:self.session];
 }
@@ -1194,7 +1136,6 @@ didFinishRecordingToOutputFileAtURL:(NSURL*)outputFileURL
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     
     [self.session removeObserver:self forKeyPath:@"running" context:SessionRunningContext];
-    [self removeObserver:self forKeyPath:@"videoDeviceInput.device.systemPressureState" context:SystemPressureContext];
 }
 
 - (void) observeValueForKeyPath:(NSString*)keyPath
@@ -1205,26 +1146,34 @@ didFinishRecordingToOutputFileAtURL:(NSURL*)outputFileURL
     if (context == SessionRunningContext) {
         BOOL isSessionRunning = [change[NSKeyValueChangeNewKey] boolValue];
         BOOL livePhotoCaptureEnabled = self.photoOutput.livePhotoCaptureEnabled;
-        BOOL depthDataDeliveryEnabled = self.photoOutput.depthDataDeliveryEnabled;
-        BOOL portraitEffectsMatteDeliveryEnabled = self.photoOutput.portraitEffectsMatteDeliveryEnabled;
-        BOOL semanticSegmentationMatteDeliveryEnabled = (self.photoOutput.enabledSemanticSegmentationMatteTypes.count > 0) ? YES: NO;
-		
+        
         dispatch_async(dispatch_get_main_queue(), ^{
-            // Only enable the ability to change camera if the device has more than one camera.
+            // Only enable the ability to change camera if the device has more
+            // than one camera.
             self.cameraButton.enabled = isSessionRunning && (self.videoDeviceDiscoverySession.uniqueDevicePositionsCount > 1);
             self.recordButton.enabled = isSessionRunning && (self.captureModeControl.selectedSegmentIndex == AVCamCaptureModeMovie);
             self.photoButton.enabled = isSessionRunning;
             self.captureModeControl.enabled = isSessionRunning;
             self.livePhotoModeButton.enabled = isSessionRunning && livePhotoCaptureEnabled;
-            self.depthDataDeliveryButton.enabled = isSessionRunning && depthDataDeliveryEnabled;
-            self.portraitEffectsMatteDeliveryButton.enabled = isSessionRunning && portraitEffectsMatteDeliveryEnabled;
-            self.semanticSegmentationMatteDeliveryButton.enabled = isSessionRunning && semanticSegmentationMatteDeliveryEnabled;
             self.photoQualityPrioritizationSegControl.enabled = isSessionRunning;
         });
     }
-    else if (context == SystemPressureContext) {
-        AVCaptureSystemPressureState* systemPressureState = change[NSKeyValueChangeNewKey];
-        [self setRecommendedFrameRateRangeForPressureState:systemPressureState];
+    else if (context == SystemPreferredCameraContext) {
+        AVCaptureDevice *systemPreferredCamera = change[NSKeyValueChangeNewKey];
+        
+        // Don't switch cameras if movie recording is in progress.
+        if (self.movieFileOutput.isRecording) {
+            return;
+        }
+        if (self.videoDeviceInput.device == systemPreferredCamera) {
+            return;
+        }
+        
+        [self changeCamera:systemPreferredCamera isUserSelection:NO completion:nil];
+    }
+    else if (context == VideoRotationAngleForHorizonLevelPreviewContext) {
+        CGFloat videoRotationAngleForHorizonLevelPreview = [change[NSKeyValueChangeNewKey] floatValue];
+        self.previewView.videoPreviewLayer.connection.videoRotationAngle = videoRotationAngleForHorizonLevelPreview;
     }
     else {
         [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
@@ -1242,7 +1191,8 @@ didFinishRecordingToOutputFileAtURL:(NSURL*)outputFileURL
     NSError* error = notification.userInfo[AVCaptureSessionErrorKey];
     NSLog(@"Capture session runtime error: %@", error);
     
-    // If media services were reset, and the last start succeeded, restart the session.
+    // If media services were reset, and the last start succeeded, restart the
+    // session.
     if (error.code == AVErrorMediaServicesWereReset) {
         dispatch_async(self.sessionQueue, ^{
             if (self.isSessionRunning) {
@@ -1261,36 +1211,15 @@ didFinishRecordingToOutputFileAtURL:(NSURL*)outputFileURL
     }
 }
 
-- (void) setRecommendedFrameRateRangeForPressureState:(AVCaptureSystemPressureState*)systemPressureState
-{
-    /*
-     The frame rates used here are for demonstrative purposes only for this app.
-     Your frame rate throttling may be different depending on your app's camera configuration.
-    */
-    AVCaptureSystemPressureLevel pressureLevel = [systemPressureState level];
-    if (pressureLevel == AVCaptureSystemPressureLevelSerious || pressureLevel == AVCaptureSystemPressureLevelCritical) {
-        if (![self.movieFileOutput isRecording] && [self.videoDeviceInput.device lockForConfiguration:nil]) {
-            NSLog(@"WARNING: Reached elevated system pressure level: %@. Throttling frame rate.", pressureLevel);
-            self.videoDeviceInput.device.activeVideoMinFrameDuration = CMTimeMake(1, 20);
-            self.videoDeviceInput.device.activeVideoMaxFrameDuration = CMTimeMake(1, 15);
-            [self.videoDeviceInput.device unlockForConfiguration];
-        }
-    }
-    else if (pressureLevel == AVCaptureSystemPressureLevelShutdown) {
-        NSLog(@"Session stopped running due to shutdown system pressure level.");
-    }
-}
-
 - (void) sessionWasInterrupted:(NSNotification*)notification
 {
-    /*
-     In some scenarios we want to enable the user to resume the session running.
-     For example, if music playback is initiated via control center while
-     using AVCam, then the user can let AVCam resume
-     the session running, which will stop music playback. Note that stopping
-     music playback in control center will not automatically resume the session
-     running. Also note that it is not always possible to resume, see -[resumeInterruptedSession:].
-    */
+    // In some scenarios we want to enable the user to resume the session
+    // running. For example, if music playback is initiated via control center
+    // while using AVCam, then the user can let AVCam resume the session
+    // running, which will stop music playback. Note that stopping music
+    // playback in control center will not automatically resume the session
+    // running. Also note that it is not always possible to resume, see
+    // -[resumeInterruptedSession:].
     BOOL showResumeButton = NO;
     
     AVCaptureSessionInterruptionReason reason = [notification.userInfo[AVCaptureSessionInterruptionReasonKey] integerValue];
@@ -1313,7 +1242,8 @@ didFinishRecordingToOutputFileAtURL:(NSURL*)outputFileURL
     }
     
     if (showResumeButton) {
-        // Fade-in a button to enable the user to try to resume the session running.
+        // Fade-in a button to enable the user to try to resume the session
+        // running.
         self.resumeButton.alpha = 0.0;
         self.resumeButton.hidden = NO;
         [UIView animateWithDuration:0.25 animations:^{
